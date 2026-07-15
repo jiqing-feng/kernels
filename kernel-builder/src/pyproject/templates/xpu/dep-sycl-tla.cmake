@@ -68,56 +68,43 @@ if(SYCL_TLA_REVISION MATCHES "^v3\\.9")
   add_compile_definitions(OLD_API=1)
 endif()
 
-# Select the XPU compilation target(s) via the KERNEL_XPU_TARGET environment
-# variable. This controls which Intel GPU targets are baked into the produced
-# extension .so:
-#   unset / "bmg" : BMG + PVC, JIT-compiled through spir64 (default, unchanged).
-#   "cri"         : CRI only, ahead-of-time compiled for intel_gpu_cri.
-#   "both"        : CRI (AOT, intel_gpu_cri) and BMG/PVC (JIT, spir64) fused
-#                   into a single fat binary that loads on both device families.
-if(DEFINED ENV{KERNEL_XPU_TARGET})
-  set(KERNEL_XPU_TARGET "$ENV{KERNEL_XPU_TARGET}")
-else()
-  set(KERNEL_XPU_TARGET "bmg")
-endif()
-message(STATUS "sycl-tla KERNEL_XPU_TARGET: ${KERNEL_XPU_TARGET}")
+# --- Retarget the fat binary at the Xe2 GPUs for sycl-tla kernels -----------
+# sycl-tla (flash-attn2 etc.) needs Xe2 matrix features (DPAS, 2D block IO,
+# bfloat16) that xe-lpg and ats-m150 cannot compile, so REPLACE the device list
+# with the Xe2 discrete GPUs. Still one .so with one AOT image per device.
+set(SYCL_AOT_DEVICES "pvc,bmg,cri")
 
-# SPIR-V extensions required by sycl-tla. The extra block-IO / matrix-multiply
-# extensions are only available on newer DPCPP / sycl-tla combinations.
-set(SYCL_TLA_SPIRV_EXT "+SPV_INTEL_split_barrier")
+# AOT-only: a spir64 JIT fallback is unneeded (kernels build only for these GPUs)
+# and unsupported alongside a per-target -spirv-ext list.
+set(SYCL_OFFLOAD_TARGETS "spir64_gen")
+
+# sycl-tla needs extra extensions (split-barrier always; block-IO and
+# matrix-multiply on newer DPCPP). Since the translator replaces the whole
+# -spirv-ext list, we query the driver's defaults and append the extras.
+set(_sycl_tla_extra_ext "+SPV_INTEL_split_barrier")
 if(DPCPP_VERSION STREQUAL "2025.2" OR DPCPP_VERSION STREQUAL "2025.3" OR DPCPP_VERSION STREQUAL "2026.0" OR SYCL_TLA_REVISION STREQUAL "v0.5")
-  string(APPEND SYCL_TLA_SPIRV_EXT ",+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
+  string(APPEND _sycl_tla_extra_ext ",+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
 endif()
 
-if(KERNEL_XPU_TARGET STREQUAL "cri")
-  # CRI: AOT-compile directly for the intel_gpu_cri target. The BMG/PVC
-  # ahead-of-time device options are not valid for intel_gpu_cri and are dropped.
-  string(REPLACE "-fsycl-targets=spir64_gen,spir64" "-fsycl-targets=intel_gpu_cri" sycl_link_flags "${sycl_link_flags}")
-  string(REPLACE "-Xs;-device pvc,xe-lpg,ats-m150 -options ' -cl-intel-enable-auto-large-GRF-mode -cl-poison-unsupported-fp64-kernels -cl-intel-greater-than-4GB-buffer-required';" "" sycl_link_flags "${sycl_link_flags}")
-  string(APPEND sycl_link_flags "-Xspirv-translator=intel_gpu_cri;-spirv-ext=${SYCL_TLA_SPIRV_EXT}")
-  string(REPLACE "-fsycl-targets=spir64_gen,spir64" "-fsycl-targets=intel_gpu_cri" sycl_flags "${sycl_flags}")
-elseif(KERNEL_XPU_TARGET STREQUAL "both")
-  # CRI (AOT) + BMG/PVC (JIT) fused into a single fat binary. The two device
-  # targets are compiled from the same sources; the SYCL compiler emits
-  # per-target code based on the built-in __SYCL_TARGET_INTEL_GPU_CRI__ macro.
-  string(REPLACE "-fsycl-targets=spir64_gen,spir64" "-fsycl-targets=intel_gpu_cri,spir64" sycl_link_flags "${sycl_link_flags}")
-  # Bind the BMG/PVC ahead-of-time device options to the spir64 target only, so
-  # they are not applied to the intel_gpu_cri target.
-  string(REPLACE "-Xs;-device pvc,xe-lpg,ats-m150" "-Xsycl-target-backend=spir64;-device bmg_g21,pvc" sycl_link_flags "${sycl_link_flags}")
-  # With multiple targets the SPIR-V translator options must name the triple
-  # explicitly. Both targets need the identical -spirv-ext list, so each
-  # -Xspirv-translator=<triple> -spirv-ext=... pair is wrapped in a SHELL:
-  # group. SHELL: keeps the two tokens together and prevents CMake from
-  # de-duplicating the identical -spirv-ext arguments (which would otherwise
-  # strip the second one and break the spir64 translator invocation).
-  string(APPEND sycl_link_flags "SHELL:-Xspirv-translator=intel_gpu_cri -spirv-ext=${SYCL_TLA_SPIRV_EXT};SHELL:-Xspirv-translator=spir64 -spirv-ext=${SYCL_TLA_SPIRV_EXT}")
-  string(REPLACE "-fsycl-targets=spir64_gen,spir64" "-fsycl-targets=intel_gpu_cri,spir64" sycl_flags "${sycl_flags}")
+set(_sycl_ext_probe "${CMAKE_CURRENT_BINARY_DIR}/_sycl_spirv_ext_probe.cpp")
+file(WRITE "${_sycl_ext_probe}" "int main() { return 0; }\n")
+# "-###" MUST be quoted: an unquoted # starts a CMake comment and would drop the
+# rest of the COMMAND, making icpx read from stdin instead of dumping its flags.
+execute_process(
+  COMMAND ${ICPX_COMPILER} -fsycl -fsycl-targets=spir64_gen "-###" "${_sycl_ext_probe}"
+  OUTPUT_VARIABLE _sycl_ext_probe_out
+  ERROR_VARIABLE _sycl_ext_probe_err)
+string(REGEX MATCH "-spirv-ext=[^\" ]+" _sycl_default_ext "${_sycl_ext_probe_out}${_sycl_ext_probe_err}")
+if(_sycl_default_ext)
+  # Strip the "-spirv-ext=-all," prefix, leaving the "+ext,+ext,..." default set.
+  string(REGEX REPLACE "^-spirv-ext=(-all,)?" "" _sycl_default_ext "${_sycl_default_ext}")
+  set(SYCL_SPIRV_EXT "${_sycl_default_ext},${_sycl_tla_extra_ext}")
 else()
-  # Default: BMG + PVC, JIT-compiled through spir64 (unchanged behaviour).
-  string(REPLACE "-fsycl-targets=spir64_gen,spir64" "-fsycl-targets=spir64" sycl_link_flags "${sycl_link_flags}")
-  string(REPLACE "-device pvc,xe-lpg,ats-m150" "-device bmg_g21,pvc" sycl_link_flags "${sycl_link_flags}")
-  string(APPEND sycl_link_flags "-Xspirv-translator;-spirv-ext=${SYCL_TLA_SPIRV_EXT}")
-  string(REPLACE "-fsycl-targets=spir64_gen,spir64" "-fsycl-targets=spir64" sycl_flags "${sycl_flags}")
+  message(WARNING "Could not determine default SPIR-V extensions from ${ICPX_COMPILER}; "
+                  "using sycl-tla extras only, which may disable compiler defaults.")
+  set(SYCL_SPIRV_EXT "${_sycl_tla_extra_ext}")
 endif()
+
+xpu_compose_sycl_flags()
 
 endif(GPU_LANG STREQUAL "SYCL")
