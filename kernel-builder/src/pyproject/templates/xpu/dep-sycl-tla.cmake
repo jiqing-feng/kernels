@@ -68,15 +68,17 @@ if(SYCL_TLA_REVISION MATCHES "^v3\\.9")
   add_compile_definitions(OLD_API=1)
 endif()
 
-# --- Retarget the fat binary at the Xe2 GPUs for sycl-tla kernels -----------
-# sycl-tla (flash-attn2 etc.) needs Xe2 matrix features (DPAS, 2D block IO,
-# bfloat16) that xe-lpg and ats-m150 cannot compile, so REPLACE the device list
-# with the Xe2 discrete GPUs. Still one .so with one AOT image per device.
-set(SYCL_AOT_DEVICES "pvc,bmg,cri")
+# --- Tri-target fat binary: pvc + bmg (fp16/bf16) + cri (fp16/bf16 + MXFP) ----
+# One .so, three AOT images. fp16/bf16 TUs compile multi-target below; the
+# block-scaled MXFP TUs are gated behind __SYCL_TARGET_INTEL_GPU_CRI__ and must
+# compile spir64_gen-only (that macro + -fsycl-targets=spir64_gen is set per
+# MXFP kernel component in build.toml, since MXFP BDPAS AOT works ONLY on cri --
+# ocloc aborts it for pvc/bmg). The generic spir64_gen image is AOT-lowered to
+# cri via `-device cri`; the pvc/bmg alias images self-target and carry no MXFP.
+set(SYCL_AOT_DEVICES "cri")
 
-# AOT-only: a spir64 JIT fallback is unneeded (kernels build only for these GPUs)
-# and unsupported alongside a per-target -spirv-ext list.
-set(SYCL_OFFLOAD_TARGETS "spir64_gen")
+# Compile fp16/bf16 for all three; MXFP components override to spir64_gen only.
+set(SYCL_OFFLOAD_TARGETS "intel_gpu_pvc,intel_gpu_bmg_g21,spir64_gen")
 
 # sycl-tla needs extra extensions (split-barrier always; block-IO and
 # matrix-multiply on newer DPCPP). Since the translator replaces the whole
